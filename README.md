@@ -1,144 +1,170 @@
-# AWS 负载均衡器基础设施项目
+# AWS Load Balancer Infrastructure Project
 
-## 项目概述
+## Project Overview
 
-本项目使用 Terraform 和 GitHub Actions 自动化部署高可用、可扩展的 AWS 负载均衡器基础设施。该基础设施包括网络负载均衡器(NLB)、EC2 实例、安全组、Route53 DNS 记录以及 CloudWatch 监控，通过基础设施即代码(IaC)方式进行管理。
+This project uses Terraform and GitHub Actions to automate the deployment of a highly available and scalable AWS load balancer infrastructure. The infrastructure is managed as Infrastructure as Code (IaC) and includes a Network Load Balancer (NLB), EC2 instances, security groups, Route53 DNS records, and CloudWatch monitoring.
 
-## 系统架构
+## What This Project Does
 
-![架构图](docs/architecture.png)
+This project provisions and manages an AWS-based application environment that routes external traffic through a Network Load Balancer to multiple web server instances, while also connecting the application layer to a MySQL server. It also integrates DNS routing and monitoring to support deployment, validation, and teardown of the infrastructure.
 
-### 核心组件
+## Why This Project Exists
 
-- **网络负载均衡器(NLB)**: 分发传入流量到多个可用区中的 EC2 实例
-- **EC2 实例**: 多可用区部署的 Web 服务器和 MySQL 数据库服务器
-- **CloudWatch 代理**: 收集 EC2 实例的日志和指标
-- **Route53**: 提供 DNS 解析，连接用户请求到负载均衡器
-- **安全组**: 控制流量的输入和输出
-- **自动化流程**: 使用 GitHub Actions 自动部署和销毁资源
+This project was created to practice and demonstrate cloud infrastructure automation on AWS using Terraform and CI/CD workflows. It focuses on reproducible infrastructure provisioning, load-balanced service deployment, and operational automation through GitHub Actions. It is especially useful for learning and showcasing:
 
-## 目录结构
+- Infrastructure as Code (IaC)
+- AWS networking and compute services
+- Load balancing and service availability
+- Automated deployment and destruction workflows
+- Basic cloud monitoring and validation
 
-```
+## System Architecture
+
+![Architecture Diagram](docs/architecture.png)
+
+### Core Components
+
+- **Network Load Balancer (NLB)**: Distributes incoming traffic to EC2 web instances
+- **EC2 Instances**: Hosts the web application and MySQL server
+- **CloudWatch Agent**: Collects logs and metrics from EC2 instances
+- **Route53**: Provides DNS resolution for the API endpoint
+- **Security Groups**: Control inbound and outbound traffic
+- **Automation Workflows**: Use GitHub Actions to deploy and destroy infrastructure
+
+## Directory Structure
+
+```text
 .
-├── .github/workflows/          # GitHub Actions 工作流配置
-│   ├── loadbalancer-deploy.yml # 部署工作流
-│   └── loadbalancer-destroy.yml # 销毁工作流
-├── terraform/                  # Terraform 配置
-│   ├── main.tf                 # 主配置文件
-│   ├── outputs.tf              # 输出定义
-│   ├── variables.tf            # 变量定义
-│   └── modules/                # 模块目录
-│       ├── loadbalancer/       # 负载均衡器模块
-│       ├── mysql/              # MySQL 模块
-│       ├── security/           # 安全配置模块
-│       └── web/                # Web 服务器模块
-└── README.md                   # 本文档
-```
+├── .github/workflows/               # GitHub Actions workflow definitions
+│   ├── loadbalancer-deploy.yml      # Deployment workflow
+│   └── loadbalancer-destroy.yml     # Destroy workflow
+├── terraform/                       # Terraform configuration
+│   ├── main.tf                      # Main infrastructure definition
+│   ├── outputs.tf                   # Output values
+│   ├── variables.tf                 # Variable definitions
+│   └── modules/                     # Terraform modules
+│       ├── loadbalancer/            # Load balancer and web tier resources
+│       ├── mysql/                   # MySQL instance resources
+│       ├── security/                # Security group definitions
+│       └── web/                     # Web server module
+└── README.md                        # Project documentation
 
-## 环境要求
+## Requirements
 
-- AWS 账户和配置凭证
-- Terraform 1.5.3 或更高版本
-- GitHub Actions 环境（或本地 act 工具用于测试）
-- 所需 AWS 权限
+- An AWS account with valid credentials
+- Terraform `1.5.3` or later
+- GitHub Actions, or `act` for local workflow testing
+- Required AWS permissions for networking, EC2, Route53, IAM, and load balancer resources
 
-## 部署说明
+## Environment Configuration
 
-### 环境变量配置
+Set the following values as GitHub Secrets or local environment variables:
 
-将以下变量配置为 GitHub Secrets 或本地环境变量:
+- `AWS_ACCESS_KEY_ID`: AWS access key ID
+- `AWS_SECRET_ACCESS_KEY`: AWS secret access key
+- `AWS_REGION`: AWS region, default is `us-east-2`
+- `AGENT_WEBAPP_AMI`: AMI ID for the web server
+- `AGENT_MYSQL_AMI`: AMI ID for the MySQL server
+- `DATABASE_USER_NAME`: Database username
+- `DATABASE_PASSWORD`: Database password
+- `WEBAPP_SECRET_KEY`: Application secret key
+- `EC2_SSH_KEY_NAME`: EC2 SSH key pair name
+- `ROUTE53_ZONE_ID`: Route53 hosted zone ID
+- `DOMAIN_NAME`: Domain name
 
-- `AWS_ACCESS_KEY_ID`: AWS 访问密钥 ID
-- `AWS_SECRET_ACCESS_KEY`: AWS 密钥
-- `AWS_REGION`: AWS 区域（默认 us-east-2）
-- `AGENT_WEBAPP_AMI`: Web 服务器 AMI ID
-- `AGENT_MYSQL_AMI`: MySQL 服务器 AMI ID
-- `DATABASE_USER_NAME`: 数据库用户名
-- `DATABASE_PASSWORD`: 数据库密码
-- `WEBAPP_SECRET_KEY`: Web 应用密钥
-- `EC2_SSH_KEY_NAME`: EC2 SSH 密钥名称
-- `ROUTE53_ZONE_ID`: Route53 托管区域 ID
-- `DOMAIN_NAME`: 域名
+## Build and Deployment
 
-### 自动化部署
+### Automated Deployment with GitHub Actions
 
-1. **使用 GitHub Actions**:
-   - 推送代码到 `main` 分支或手动触发工作流
-   - GitHub Actions 将自动执行部署
+1. Push changes to the `main` branch, or manually trigger the workflow.
+2. GitHub Actions will run the deployment process automatically.
 
-2. **本地测试部署**:
+### Local Workflow Testing with `act`
+
+```bash
+act --secret-file .env -W .github/workflows/loadbalancer-deploy.yml
+
+### Manual Terraform Deployment
+
+1. Clone the repository:
+
    ```bash
-   act --secret-file .env -W .github/workflows/loadbalancer-deploy.yml
-   ```
+   git clone <repository-url>
+   cd cloud-project-terraform-aws-infra-Yuqingliu23
 
-### 手动部署
+### Initialize Terraform:
 
-1. 克隆仓库:
-   ```bash
-   git clone <仓库 URL>
-   cd afnjfm
-   ```
+cd terraform
+terraform init
+Review the execution plan:
 
-2. 初始化 Terraform:
-   ```bash
-   cd terraform
-   terraform init
-   ```
+terraform plan -var-file=terraform.tfvars
+Apply the infrastructure:
 
-3. 部署基础设施:
-   ```bash
-   terraform apply -var-file=terraform.tfvars
-   ```
+terraform apply -var-file=terraform.tfvars
+How to Reproduce
+To reproduce this project from scratch:
 
-## 销毁基础设施
+### Prepare an AWS account and configure the required credentials.
+Create or obtain valid AMIs for the web application and MySQL server.
+Configure all required secrets or environment variables.
+Clone this repository.
+Run the deployment using one of the following methods:
+GitHub Actions
+Manual Terraform commands
+Local workflow testing with act
+Wait for the infrastructure to initialize fully.
+Verify the deployed API endpoint and load balancer behavior.
+If Route53 is configured correctly, the deployment should expose an endpoint like:
 
-1. **使用 GitHub Actions**:
-   - 手动触发 `loadbalancer-destroy.yml` 工作流
+api.<your-domain-name>
+You can then test endpoints such as:
 
-2. **本地测试销毁**:
-   ```bash
-   act --secret-file .env -W .github/workflows/loadbalancer-destroy.yml
-   ```
+/v1/healthcheck
+/v2/metadata
+Infrastructure Destruction
+Using GitHub Actions
+Manually trigger the loadbalancer-destroy.yml workflow.
 
-3. **手动销毁**:
-   ```bash
-   cd terraform
-   terraform destroy -var-file=terraform.tfvars
-   ```
+Local Destroy Test with act
+act --secret-file .env -W .github/workflows/loadbalancer-destroy.yml
+Manual Destruction
+cd terraform
+terraform destroy -var-file=terraform.tfvars
+Validation and Testing
+This project includes validation for the deployed load balancer and metadata API.
 
-## CloudWatch 监控
+Example test script:
 
-负载均衡器基础设施配置了 CloudWatch 代理，用于收集以下指标:
+python3 test_lb_api_metadata.py -d api.<your-domain-name> -n 100
+The test checks whether requests are correctly distributed across backend instances and whether the metadata endpoint returns valid instance and availability zone information.
 
-- EC2 实例 CPU、内存、磁盘利用率
-- 网络流量统计
-- 应用程序日志
+CloudWatch Monitoring
+The infrastructure configures CloudWatch Agent to collect:
 
-## 问题排查
+EC2 CPU, memory, and disk utilization
+Network traffic metrics
+Application logs
+Troubleshooting
+Common Issues
+Deployment failure during Terraform initialization
 
-### 常见问题
+Check AWS credentials and permissions
+For local testing, try offline initialization:
+terraform init -backend=false
+Resource deletion failure caused by VPC dependencies
 
-1. **部署失败 - Terraform 初始化错误**
-   - 检查 AWS 凭证和权限
-   - 本地测试时，使用离线模式: `terraform init -backend=false`
+The destroy workflow includes additional cleanup steps for dependent resources
+For manual cleanup, delete child resources before parent resources
+CloudWatch Agent configuration issues
 
-2. **VPC 依赖关系删除错误**
-   - 销毁工作流包含全面的 VPC 依赖清理步骤
-   - 对于手动清理，请按照先删除子资源再删除父资源的顺序
-
-3. **CloudWatch 代理配置问题**
-   - 确保 IAM 角色正确配置
-   - 检查 IMDS 配置允许 IMDSv2
-
-### 调试工具
-
-- 查看 GitHub Actions 工作流日志
-- 使用 AWS 控制台检查资源状态
-- 查阅 CloudWatch 日志了解详细错误信息
-
-## 安全考虑
-
-- 安全组限制了只有必要端口才开放
-- 数据库密码和其他敏感信息通过 GitHub Secrets 安全存储
-- EC2 实例使用 IAM 角色而非硬编码凭证
+Make sure IAM roles or credentials are configured correctly
+Check EC2 metadata service settings if monitoring does not start as expected
+Debugging Tools
+Review GitHub Actions workflow logs
+Inspect deployed resources in the AWS Console
+Check CloudWatch logs and metrics for runtime details
+## Security Considerations
+Security groups restrict access to only required ports
+Sensitive values such as database credentials are stored in GitHub Secrets
+IAM roles are preferred over hard-coded credentials whenever possible
