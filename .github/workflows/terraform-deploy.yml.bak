@@ -1,0 +1,125 @@
+name: Deploy Infrastructure with Terraform
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-2
+  TERRAFORM_DIR: terraform
+  TF_VAR_mysql_instance_type: t2.micro
+  TF_VAR_webapp_instance_type: t2.micro
+
+jobs:
+  deploy-infra:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.3
+
+    - name: Fix Terraform permissions
+      run: |
+        # Fix permissions for Terraform executable
+        if [ -n "$TERRAFORM_CLI_PATH" ]; then
+          chmod +x $TERRAFORM_CLI_PATH/terraform
+          ls -la $TERRAFORM_CLI_PATH
+        else
+          echo "TERRAFORM_CLI_PATH not set, trying to find terraform binary..."
+          find /tmp -name terraform -type f -exec chmod +x {} \;
+        fi
+
+    - name: Set environment variables for terraform
+      run: |
+        # get AMI from secrets
+        echo "TF_VAR_web_ami=${{ secrets.AGENT_WEBAPP_AMI }}" >> $GITHUB_ENV
+        echo "TF_VAR_mysql_ami=${{ secrets.AGENT_MYSQL_AMI }}" >> $GITHUB_ENV
+        
+        # other necessary variables (from GitHub Secrets)
+        echo "TF_VAR_db_user=${{ secrets.DATABASE_USER_NAME }}" >> $GITHUB_ENV
+        echo "TF_VAR_db_password=${{ secrets.DATABASE_PASSWORD }}" >> $GITHUB_ENV
+        echo "TF_VAR_webapp_secret_key=${{ secrets.WEBAPP_SECRET_KEY }}" >> $GITHUB_ENV
+        echo "TF_VAR_ssh_key_path=~/.ssh/id_rsa" >> $GITHUB_ENV
+        echo "TF_VAR_ssh_key_name=${{ secrets.EC2_SSH_KEY_NAME }}" >> $GITHUB_ENV
+        echo "TF_VAR_ec2_ssh_key_name=${{ secrets.EC2_SSH_KEY_NAME }}" >> $GITHUB_ENV
+        
+        # AWS credentials for CloudWatch Agent
+        echo "TF_VAR_aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+        echo "TF_VAR_aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+        
+        echo "Using MySQL AMI: ${{ secrets.AGENT_MYSQL_AMI }}"
+        echo "Using WebApp AMI: ${{ secrets.AGENT_WEBAPP_AMI }}"
+
+    - name: Debug Environment Variables
+      run: |
+        echo "Current Terraform Variables:"
+        env | grep "TF_VAR_" | sort
+        echo "AWS Region: ${{ env.AWS_REGION }}"
+
+    - name: Terraform Format
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform fmt -recursive || echo "Formatting issues found, but continuing..."
+
+    - name: Terraform Init
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform init
+
+    - name: Terraform Validate
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform validate -no-color
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform plan \
+          -var "aws_region=${{ env.AWS_REGION }}" \
+          -var "web_ami=${{ env.TF_VAR_web_ami }}" \
+          -var "mysql_ami=${{ env.TF_VAR_mysql_ami }}" \
+          -var "db_user=${{ env.TF_VAR_db_user }}" \
+          -var "db_password=${{ env.TF_VAR_db_password }}" \
+          -var "webapp_secret_key=${{ env.TF_VAR_webapp_secret_key }}" \
+          -var "ssh_key_path=${{ env.TF_VAR_ssh_key_path }}" \
+          -var "ssh_key_name=${{ env.TF_VAR_ssh_key_name }}" \
+          -var "ec2_ssh_key_name=${{ env.TF_VAR_ec2_ssh_key_name }}" \
+          -input=false \
+          -no-color \
+          -out=tfplan
+      continue-on-error: true
+
+    - name: Terraform Plan Status
+      if: steps.plan.outcome == 'failure'
+      run: |
+        echo "Terraform Plan Failed!"
+        exit 1
+
+    - name: Terraform Apply
+
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform apply "tfplan"
+
+    - name: Get Outputs
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        echo "Infrastructure Outputs:"
+        terraform output -json

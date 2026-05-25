@@ -1,0 +1,127 @@
+name: Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to run tests against'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+
+permissions:
+  checks: write
+  actions: read
+  contents: read
+
+jobs:
+  assignment-grader:
+    runs-on: ubuntu-latest
+    container:
+      image: hashicorp/terraform:1.5.0
+    environment:
+      name: AWS_DEPLOYMENT
+    env:
+      TEST_USER_EMAIL: ${{ vars.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Start Grading
+        run: echo "==== Start Grading ===="
+
+      - name: Install Dependencies
+        run: |
+          apk update
+          apk add --no-cache \
+            curl \
+            unzip \
+            nodejs \
+            npm \
+            aws-cli \
+            jq \
+            bash
+
+      - name: Configure AWS Credentialsg
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-2
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: latest
+
+      - name: Disable Terraform Debug
+        run: |
+          echo "TF_LOG=ERROR" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Check Format
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+      
+      # Put all the github secrets and variables into terraform.vars
+      - name: Set Terraform Variables
+        run: |
+          touch terraform.tfvars
+          echo "web_ami = \"${{ secrets.WEBAPP_AMI_ID }}\"" >> terraform/terraform.tfvars
+          echo "mysql_ami = \"${{ secrets.MYSQL_AMI_ID }}\"" >> terraform/terraform.tfvars
+          echo "db_user = \"${{ secrets.DATABASE_USER_NAME }}\"" >> terraform/terraform.tfvars
+          echo "db_password = \"${{ secrets.DATABASE_PASSWORD }}\"" >> terraform/terraform.tfvars
+          echo "webapp_secret_key = \"${{ secrets.WEBAPP_SECRET_KEY }}\"" >> terraform/terraform.tfvars
+          cat terraform/terraform.tfvars
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: terraform plan
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve
+
+      - name: Terraform Output
+        working-directory: terraform
+        run: |
+          WEBAPP_PUBLIC_IP=$(terraform output -raw webapp_public_ip)
+          echo "WEBAPP_PUBLIC_IP=$WEBAPP_PUBLIC_IP" >> $GITHUB_ENV
+          echo "WEBAPP_PUBLIC_IP=$WEBAPP_PUBLIC_IP"
+
+      - name: Setup Test Environment
+        run: |
+         echo "API_BASE_URL=$WEBAPP_PUBLIC_IP" >> .env
+         echo "TEST_USER_EMAIL=${{ vars.TEST_USER_EMAIL }}" >> .env
+         echo "TEST_USER_PASSWORD=${{ secrets.TEST_USER_PASSWORD }}" >> .env
+
+        working-directory: ./web-app
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18' 
+        
+      - name: Install Dependencies
+        run: npm install
+        working-directory: ./web-app
+
+      - name: Run Integration Tests
+        run: npm test
+        working-directory: ./web-app
+
+      - name: Terraform Destroy
+        if: always()
+        continue-on-error: true
+        run: terraform destroy -auto-approve

@@ -1,0 +1,31 @@
+# IntelliJ IDEA
+/.idea/
+/*.iml
+
+# VS Code
+/.vscode/
+
+# MacOS generated files
+.DS_Store
+
+# AWS configuration files
+/.aws/
+
+# SSH Keys
+*.pem
+
+# Logs
+*.log
+/**/node_modules/
+tmp*
+/web-app/.env
+
+/**/.idea
+/**/package-lock.json
+/**/.keep
+
+.env
+
+logs/**
+
+web-app/coverage

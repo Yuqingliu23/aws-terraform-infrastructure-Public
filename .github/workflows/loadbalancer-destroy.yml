@@ -1,0 +1,663 @@
+name: Destroy Load Balancer Infrastructure
+on:
+  workflow_dispatch:  # 允许手动触发
+
+env:
+  AWS_REGION: us-east-2
+  TERRAFORM_DIR: terraform
+
+jobs:
+  destroy-loadbalancer:
+    name: Destroy Load Balancer Resources
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Install AWS CLI
+      run: |
+        if command -v aws &> /dev/null; then
+          echo "AWS CLI already installed"
+          aws --version
+        else
+          echo "Installing AWS CLI..."
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install
+        fi
+        aws --version
+
+    - name: Setup AWS CLI Environment
+      run: |
+        # Disable AWS CLI pager
+        echo "AWS_PAGER=" >> $GITHUB_ENV
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.3
+
+    - name: Fix Terraform permissions
+      run: |
+        # Fix permissions for Terraform executable
+        if [ -n "$TERRAFORM_CLI_PATH" ]; then
+          chmod +x $TERRAFORM_CLI_PATH/terraform
+          ls -la $TERRAFORM_CLI_PATH
+        else
+          echo "TERRAFORM_CLI_PATH not set, trying to find terraform binary..."
+          which terraform || echo "Terraform not found in PATH"
+          find /tmp -name terraform -type f -exec chmod +x {} \; 2>/dev/null || echo "No terraform binaries found in /tmp"
+        fi
+
+    - name: Set environment variables for terraform
+      run: |
+        # get AMI from secrets
+        echo "TF_VAR_web_ami=${{ secrets.AGENT_WEBAPP_AMI }}" >> $GITHUB_ENV
+        echo "TF_VAR_mysql_ami=${{ secrets.AGENT_MYSQL_AMI }}" >> $GITHUB_ENV
+        
+        # other necessary variables (from GitHub Secrets)
+        echo "TF_VAR_db_user=${{ secrets.DATABASE_USER_NAME }}" >> $GITHUB_ENV
+        echo "TF_VAR_db_password=${{ secrets.DATABASE_PASSWORD }}" >> $GITHUB_ENV
+        echo "TF_VAR_webapp_secret_key=${{ secrets.WEBAPP_SECRET_KEY }}" >> $GITHUB_ENV
+        echo "TF_VAR_ssh_key_path=~/.ssh/id_rsa" >> $GITHUB_ENV
+        echo "TF_VAR_ssh_key_name=${{ secrets.EC2_SSH_KEY_NAME }}" >> $GITHUB_ENV
+        echo "TF_VAR_ec2_ssh_key_name=${{ secrets.EC2_SSH_KEY_NAME }}" >> $GITHUB_ENV
+        
+        # Load balancer specific variables
+        echo "TF_VAR_route53_zone_id=${{ secrets.ROUTE53_ZONE_ID }}" >> $GITHUB_ENV
+        echo "TF_VAR_domain_name=${{ secrets.DOMAIN_NAME }}" >> $GITHUB_ENV
+        
+        # AWS credentials for CloudWatch Agent
+        echo "TF_VAR_aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+        echo "TF_VAR_aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+        echo "TF_VAR_aws_region=${{ env.AWS_REGION }}" >> $GITHUB_ENV
+        
+        echo "Using Region: ${{ env.AWS_REGION }}"
+        echo "Using Domain: ${{ secrets.DOMAIN_NAME }}"
+
+    - name: Terraform Init
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        # Check if we're running in act
+        if [ -f "/.dockerenv" ] || [ -d "/var/run/act" ]; then
+          # Running in act - use offline mode with skip provider verification
+          echo "Running in act environment, using offline mode for terraform init"
+          # Create provider directory if it doesn't exist
+          mkdir -p .terraform/providers
+          terraform init -input=false -backend=false -reconfigure || echo "Terraform init failed but continuing"
+        else
+          # Running in real GitHub Actions
+          terraform init
+        fi
+
+    - name: Delete Route53 Records with AWS CLI
+      run: |
+        echo "Deleting Route53 records..."
+        
+        # Find and delete Route53 records
+        RECORD_NAME="api.${{ env.TF_VAR_domain_name }}."
+        ZONE_ID="${{ env.TF_VAR_route53_zone_id }}"
+        
+        echo "Looking for domain $RECORD_NAME in zone $ZONE_ID"
+        
+        # Get record details
+        RECORD_VALUE=$(aws route53 list-resource-record-sets \
+          --hosted-zone-id "$ZONE_ID" \
+          --query "ResourceRecordSets[?Name=='$RECORD_NAME' && Type=='CNAME'].ResourceRecords[0].Value" \
+          --output text)
+          
+        if [ -n "$RECORD_VALUE" ] && [ "$RECORD_VALUE" != "None" ]; then
+          echo "Found CNAME record: $RECORD_NAME -> $RECORD_VALUE"
+          
+          # Create JSON file for record deletion
+          echo '{' > delete-record.json
+          echo '  "Changes": [' >> delete-record.json
+          echo '    {' >> delete-record.json
+          echo '      "Action": "DELETE",' >> delete-record.json
+          echo '      "ResourceRecordSet": {' >> delete-record.json
+          echo "        \"Name\": \"$RECORD_NAME\"," >> delete-record.json
+          echo '        "Type": "CNAME",' >> delete-record.json
+          echo '        "TTL": 60,' >> delete-record.json
+          echo '        "ResourceRecords": [' >> delete-record.json
+          echo '          {' >> delete-record.json
+          echo "            \"Value\": \"$RECORD_VALUE\"" >> delete-record.json
+          echo '          }' >> delete-record.json
+          echo '        ]' >> delete-record.json
+          echo '      }' >> delete-record.json
+          echo '    }' >> delete-record.json
+          echo '  ]' >> delete-record.json
+          echo '}' >> delete-record.json
+          
+          # Delete the record
+          echo "Deleting record..."
+          aws route53 change-resource-record-sets \
+            --hosted-zone-id "$ZONE_ID" \
+            --change-batch file://delete-record.json || echo "Failed to delete record, may already be deleted"
+            
+          echo "Route53 record deletion request submitted"
+        else
+          echo "CNAME record $RECORD_NAME not found"
+        fi
+
+    - name: Delete Load Balancer Resources with AWS CLI
+      run: |
+        echo "Deleting load balancer resources..."
+        
+        # Disable pager
+        export AWS_PAGER=""
+        
+        # Find and delete target group attachments
+        TARGET_GROUP_ARN=$(aws elbv2 describe-target-groups \
+          --names loadbalancer-nlb-tg \
+          --query 'TargetGroups[0].TargetGroupArn' \
+          --output text 2>/dev/null || echo "")
+          
+        if [ -n "$TARGET_GROUP_ARN" ] && [ "$TARGET_GROUP_ARN" != "None" ]; then
+          echo "Found target group: $TARGET_GROUP_ARN"
+          
+          # Find targets in the target group
+          TARGETS=$(aws elbv2 describe-target-health \
+            --target-group-arn "$TARGET_GROUP_ARN" \
+            --query 'TargetHealthDescriptions[*].Target.Id' \
+            --output text)
+            
+          # Remove all targets
+          for TARGET_ID in $TARGETS; do
+            echo "Removing instance from target group: $TARGET_ID"
+            aws elbv2 deregister-targets \
+              --target-group-arn "$TARGET_GROUP_ARN" \
+              --targets Id=$TARGET_ID || echo "Failed to remove target: $TARGET_ID"
+          done
+          
+          echo "Waiting for target deregistration to complete (10 seconds)..."
+          sleep 10
+        else
+          echo "Target group loadbalancer-nlb-tg not found"
+        fi
+        
+        # Find and delete load balancer
+        LB_ARN=$(aws elbv2 describe-load-balancers \
+          --names loadbalancer-api-nlb \
+          --query 'LoadBalancers[0].LoadBalancerArn' \
+          --output text 2>/dev/null || echo "")
+          
+        if [ -n "$LB_ARN" ] && [ "$LB_ARN" != "None" ]; then
+          echo "Found load balancer: $LB_ARN"
+          
+          # Delete listeners
+          LISTENERS=$(aws elbv2 describe-listeners \
+            --load-balancer-arn "$LB_ARN" \
+            --query 'Listeners[*].ListenerArn' \
+            --output text)
+            
+          for LISTENER in $LISTENERS; do
+            echo "Deleting listener: $LISTENER"
+            aws elbv2 delete-listener --listener-arn "$LISTENER" || echo "Failed to delete listener: $LISTENER"
+          done
+          
+          echo "Waiting for listener deletion to complete (10 seconds)..."
+          sleep 10
+          
+          # Delete load balancer
+          echo "Deleting load balancer: $LB_ARN"
+          aws elbv2 delete-load-balancer --load-balancer-arn "$LB_ARN" || echo "Failed to delete load balancer: $LB_ARN"
+          
+          echo "Waiting for load balancer deletion to complete (30 seconds)..."
+          sleep 30
+        else
+          echo "Load balancer loadbalancer-api-nlb not found"
+        fi
+        
+        # Delete target group
+        if [ -n "$TARGET_GROUP_ARN" ] && [ "$TARGET_GROUP_ARN" != "None" ]; then
+          echo "Deleting target group: $TARGET_GROUP_ARN"
+          aws elbv2 delete-target-group --target-group-arn "$TARGET_GROUP_ARN" || echo "Failed to delete target group: $TARGET_GROUP_ARN"
+        fi
+        
+    - name: Delete EC2 Instances
+      run: |
+        echo "Finding and terminating Web EC2 instances..."
+        
+        # Disable pager
+        export AWS_PAGER=""
+        
+        # Find EC2 instances with specific tags
+        INSTANCES=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=loadbalancer-web-server-*" "Name=instance-state-name,Values=running" \
+          --query 'Reservations[*].Instances[*].InstanceId' \
+          --output text)
+          
+        if [ -n "$INSTANCES" ]; then
+          echo "Found the following web instances: $INSTANCES"
+          
+          # Terminate instances
+          echo "Terminating web instances..."
+          aws ec2 terminate-instances --instance-ids $INSTANCES || echo "Failed to terminate instances, may already be terminated"
+          
+          echo "Waiting for instances to terminate (60 seconds)..."
+          sleep 60
+        else
+          echo "No loadbalancer web server instances found"
+        fi
+
+        echo "Finding and terminating MySQL EC2 instances..."
+        
+        # Find MySQL EC2 instances
+        MYSQL_INSTANCES=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=loadbalancer-mysql-server" "Name=instance-state-name,Values=running" \
+          --query 'Reservations[*].Instances[*].InstanceId' \
+          --output text)
+          
+        if [ -n "$MYSQL_INSTANCES" ]; then
+          echo "Found the following MySQL instances: $MYSQL_INSTANCES"
+          
+          # Terminate MySQL instances
+          echo "Terminating MySQL instances..."
+          aws ec2 terminate-instances --instance-ids $MYSQL_INSTANCES || echo "Failed to terminate MySQL instances, may already be terminated"
+          
+          echo "Waiting for MySQL instances to terminate (60 seconds)..."
+          sleep 60
+        else
+          echo "No MySQL instances found"
+        fi
+        
+    - name: Delete Security Groups
+      run: |
+        echo "Finding and deleting security groups..."
+        
+        # Disable pager
+        export AWS_PAGER=""
+        
+        # Find and delete NLB security group
+        NLB_SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=loadbalancer-nlb-sg" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null || echo "")
+          
+        # Find and delete web-lb security group
+        WEB_SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=loadbalancer-web-lb-sg" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null || echo "")
+          
+        # Find and delete MySQL security group
+        MYSQL_SG_ID=$(aws ec2 describe-security-groups \
+          --filters "Name=group-name,Values=loadbalancer-mysql-sg" \
+          --query 'SecurityGroups[0].GroupId' \
+          --output text 2>/dev/null || echo "")
+          
+        if [ -n "$NLB_SG_ID" ] && [ "$NLB_SG_ID" != "None" ]; then
+          echo "Found NLB security group: $NLB_SG_ID"
+          
+          # Wait to ensure dependent resources are deleted
+          echo "Waiting to ensure dependent resources are deleted (10 seconds)..."
+          sleep 10
+          
+          # Delete security group rules
+          echo "Deleting security group ingress rules..."
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$NLB_SG_ID" \
+            --ip-permissions "$(aws ec2 describe-security-groups --group-ids "$NLB_SG_ID" --query 'SecurityGroups[0].IpPermissions' --output json)" \
+            || echo "No ingress rules or deletion failed"
+            
+          # Delete security group
+          echo "Deleting NLB security group..."
+          aws ec2 delete-security-group --group-id "$NLB_SG_ID" || echo "Failed to delete NLB security group, dependent resources may exist"
+        else
+          echo "NLB security group not found"
+        fi
+        
+        if [ -n "$WEB_SG_ID" ] && [ "$WEB_SG_ID" != "None" ]; then
+          echo "Found Web security group: $WEB_SG_ID"
+          
+          # Wait to ensure dependent resources are deleted
+          echo "Waiting to ensure dependent resources are deleted (10 seconds)..."
+          sleep 10
+          
+          # Delete security group rules
+          echo "Deleting security group ingress rules..."
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$WEB_SG_ID" \
+            --ip-permissions "$(aws ec2 describe-security-groups --group-ids "$WEB_SG_ID" --query 'SecurityGroups[0].IpPermissions' --output json)" \
+            || echo "No ingress rules or deletion failed"
+            
+          # Delete security group
+          echo "Deleting Web security group..."
+          aws ec2 delete-security-group --group-id "$WEB_SG_ID" || echo "Failed to delete Web security group, dependent resources may exist"
+        else
+          echo "Web security group not found"
+        fi
+        
+        if [ -n "$MYSQL_SG_ID" ] && [ "$MYSQL_SG_ID" != "None" ]; then
+          echo "Found MySQL security group: $MYSQL_SG_ID"
+          
+          # Wait to ensure dependent resources are deleted
+          echo "Waiting to ensure dependent resources are deleted (10 seconds)..."
+          sleep 10
+          
+          # Delete security group rules
+          echo "Deleting security group ingress rules..."
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$MYSQL_SG_ID" \
+            --ip-permissions "$(aws ec2 describe-security-groups --group-ids "$MYSQL_SG_ID" --query 'SecurityGroups[0].IpPermissions' --output json)" \
+            || echo "No ingress rules or deletion failed"
+            
+          # Delete security group
+          echo "Deleting MySQL security group..."
+          aws ec2 delete-security-group --group-id "$MYSQL_SG_ID" || echo "Failed to delete MySQL security group, dependent resources may exist"
+        else
+          echo "MySQL security group not found"
+        fi
+        
+        echo "Cleanup complete"
+
+    - name: Delete VPC Resources with AWS CLI
+      run: |
+        echo "Finding and deleting VPC resources..."
+        
+        # Disable pager
+        export AWS_PAGER=""
+        
+        # Find Internet Gateway in the VPC
+        VPC_ID=$(aws ec2 describe-vpcs \
+          --filters "Name=tag:Name,Values=loadbalancer-vpc" \
+          --query 'Vpcs[0].VpcId' \
+          --output text 2>/dev/null || echo "")
+        
+        if [ -n "$VPC_ID" ] && [ "$VPC_ID" != "None" ]; then
+          echo "Found VPC: $VPC_ID"
+          
+          # Find and terminate any instances in the VPC that might have been missed
+          echo "Checking for any running EC2 instances in VPC..."
+          INSTANCE_IDS=$(aws ec2 describe-instances \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=instance-state-name,Values=running,stopped,pending,stopping" \
+            --query 'Reservations[*].Instances[*].InstanceId' \
+            --output text)
+            
+          if [ -n "$INSTANCE_IDS" ]; then
+            echo "Found instances still in VPC: $INSTANCE_IDS"
+            for INSTANCE_ID in $INSTANCE_IDS; do
+              echo "Terminating instance: $INSTANCE_ID"
+              aws ec2 terminate-instances --instance-ids "$INSTANCE_ID"
+              echo "Waiting for instance to terminate..."
+              aws ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
+            done
+          else
+            echo "No EC2 instances found in VPC"
+          fi
+          
+          # Find and delete Network Interfaces in the VPC
+          echo "Finding and deleting Network Interfaces..."
+          ENI_IDS=$(aws ec2 describe-network-interfaces \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+            --output text)
+            
+          if [ -n "$ENI_IDS" ]; then
+            for ENI_ID in $ENI_IDS; do
+              echo "Deleting Network Interface: $ENI_ID"
+              # Detach if attached
+              ATTACHMENT_ID=$(aws ec2 describe-network-interfaces \
+                --network-interface-ids "$ENI_ID" \
+                --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
+                --output text 2>/dev/null)
+                
+              if [ -n "$ATTACHMENT_ID" ] && [ "$ATTACHMENT_ID" != "None" ]; then
+                echo "Detaching Network Interface: $ENI_ID (Attachment: $ATTACHMENT_ID)"
+                aws ec2 detach-network-interface \
+                  --attachment-id "$ATTACHMENT_ID" \
+                  --force || echo "Failed to detach network interface"
+                  
+                # Wait for detachment
+                echo "Waiting for detachment to complete..."
+                sleep 10
+              fi
+              
+              aws ec2 delete-network-interface \
+                --network-interface-id "$ENI_ID" || echo "Failed to delete Network Interface: $ENI_ID"
+            done
+          else
+            echo "No Network Interfaces found in VPC"
+          fi
+          
+          # Find and delete NAT Gateways
+          echo "Finding and deleting NAT Gateways..."
+          NAT_IDS=$(aws ec2 describe-nat-gateways \
+            --filter "Name=vpc-id,Values=$VPC_ID" \
+            --query 'NatGateways[?State!=`deleted`].NatGatewayId' \
+            --output text)
+            
+          if [ -n "$NAT_IDS" ] && [ "$NAT_IDS" != "None" ]; then
+            for NAT_ID in $NAT_IDS; do
+              echo "Deleting NAT Gateway: $NAT_ID"
+              aws ec2 delete-nat-gateway --nat-gateway-id "$NAT_ID"
+              echo "Waiting for NAT Gateway to delete (this may take a few minutes)..."
+              while true; do
+                NAT_STATE=$(aws ec2 describe-nat-gateways \
+                  --nat-gateway-ids "$NAT_ID" \
+                  --query 'NatGateways[0].State' \
+                  --output text 2>/dev/null || echo "deleted")
+                if [ "$NAT_STATE" = "deleted" ]; then
+                  echo "NAT Gateway deleted"
+                  break
+                else
+                  echo "NAT Gateway state: $NAT_STATE"
+                  sleep 15
+                fi
+              done
+            done
+          else
+            echo "No active NAT Gateways found in VPC"
+          fi
+          
+          # Find and delete VPC Endpoints
+          echo "Finding and deleting VPC Endpoints..."
+          ENDPOINT_IDS=$(aws ec2 describe-vpc-endpoints \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'VpcEndpoints[*].VpcEndpointId' \
+            --output text)
+            
+          if [ -n "$ENDPOINT_IDS" ] && [ "$ENDPOINT_IDS" != "None" ]; then
+            for ENDPOINT_ID in $ENDPOINT_IDS; do
+              echo "Deleting VPC Endpoint: $ENDPOINT_ID"
+              aws ec2 delete-vpc-endpoints --vpc-endpoint-ids "$ENDPOINT_ID"
+              echo "Waiting for endpoint deletion..."
+              sleep 5
+            done
+          else
+            echo "No VPC Endpoints found in VPC"
+          fi
+          
+          # Find Internet Gateway
+          IGW_ID=$(aws ec2 describe-internet-gateways \
+            --filters "Name=attachment.vpc-id,Values=$VPC_ID" \
+            --query 'InternetGateways[0].InternetGatewayId' \
+            --output text 2>/dev/null || echo "")
+          
+          if [ -n "$IGW_ID" ] && [ "$IGW_ID" != "None" ]; then
+            echo "Found Internet Gateway: $IGW_ID"
+            echo "Detaching Internet Gateway from VPC..."
+            aws ec2 detach-internet-gateway \
+              --internet-gateway-id "$IGW_ID" \
+              --vpc-id "$VPC_ID" || echo "Failed to detach Internet Gateway"
+            
+            echo "Deleting Internet Gateway..."
+            aws ec2 delete-internet-gateway \
+              --internet-gateway-id "$IGW_ID" || echo "Failed to delete Internet Gateway"
+          else
+            echo "No Internet Gateway found for VPC"
+          fi
+          
+          # Delete all security groups associated with VPC (except default)
+          echo "Finding and deleting remaining Security Groups..."
+          SG_IDS=$(aws ec2 describe-security-groups \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=group-name,Values=!default" \
+            --query 'SecurityGroups[*].GroupId' \
+            --output text)
+            
+          if [ -n "$SG_IDS" ] && [ "$SG_IDS" != "None" ]; then
+            for SG_ID in $SG_IDS; do
+              echo "Found Security Group: $SG_ID"
+              # Delete all ingress rules
+              echo "Removing all ingress rules from Security Group: $SG_ID"
+              aws ec2 revoke-security-group-ingress \
+                --group-id "$SG_ID" \
+                --ip-permissions "$(aws ec2 describe-security-groups \
+                  --group-ids "$SG_ID" \
+                  --query 'SecurityGroups[0].IpPermissions' \
+                  --output json)" 2>/dev/null || echo "No ingress rules or deletion failed"
+                  
+              # Delete all egress rules
+              echo "Removing all egress rules from Security Group: $SG_ID"
+              aws ec2 revoke-security-group-egress \
+                --group-id "$SG_ID" \
+                --ip-permissions "$(aws ec2 describe-security-groups \
+                  --group-ids "$SG_ID" \
+                  --query 'SecurityGroups[0].IpPermissionsEgress' \
+                  --output json)" 2>/dev/null || echo "No egress rules or deletion failed"
+                  
+              echo "Deleting Security Group: $SG_ID"
+              aws ec2 delete-security-group --group-id "$SG_ID" \
+                || echo "Failed to delete Security Group: $SG_ID, retrying later"
+            done
+          else
+            echo "No non-default Security Groups found in VPC"
+          fi
+          
+          # Find and delete Route Tables
+          echo "Finding custom route tables..."
+          RT_IDS=$(aws ec2 describe-route-tables \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=association.main,Values=false" \
+            --query 'RouteTables[*].RouteTableId' \
+            --output text)
+          
+          for RT_ID in $RT_IDS; do
+            echo "Found Route Table: $RT_ID"
+            
+            # Get associations
+            RT_ASSOC_IDS=$(aws ec2 describe-route-tables \
+              --route-table-ids "$RT_ID" \
+              --query 'RouteTables[0].Associations[*].RouteTableAssociationId' \
+              --output text)
+            
+            # Disassociate route table
+            for ASSOC_ID in $RT_ASSOC_IDS; do
+              echo "Disassociating Route Table Association: $ASSOC_ID"
+              aws ec2 disassociate-route-table \
+                --association-id "$ASSOC_ID" || echo "Failed to disassociate Route Table"
+            done
+            
+            # Delete routes first
+            echo "Deleting routes from Route Table: $RT_ID"
+            ROUTE_DESTS=$(aws ec2 describe-route-tables \
+              --route-table-ids "$RT_ID" \
+              --query 'RouteTables[0].Routes[?GatewayId != `local`].DestinationCidrBlock' \
+              --output text)
+              
+            for DEST in $ROUTE_DESTS; do
+              echo "Deleting route to $DEST from Route Table: $RT_ID"
+              aws ec2 delete-route \
+                --route-table-id "$RT_ID" \
+                --destination-cidr-block "$DEST" || echo "Failed to delete route"
+            done
+            
+            # Delete route table
+            echo "Deleting Route Table: $RT_ID"
+            aws ec2 delete-route-table \
+              --route-table-id "$RT_ID" || echo "Failed to delete Route Table"
+          done
+          
+          # Find and delete Network ACLs (except default)
+          echo "Finding and deleting Network ACLs..."
+          NACL_IDS=$(aws ec2 describe-network-acls \
+            --filters "Name=vpc-id,Values=$VPC_ID" "Name=default,Values=false" \
+            --query 'NetworkAcls[*].NetworkAclId' \
+            --output text)
+            
+          if [ -n "$NACL_IDS" ] && [ "$NACL_IDS" != "None" ]; then
+            for NACL_ID in $NACL_IDS; do
+              echo "Deleting Network ACL: $NACL_ID"
+              aws ec2 delete-network-acl --network-acl-id "$NACL_ID" \
+                || echo "Failed to delete Network ACL: $NACL_ID"
+            done
+          else
+            echo "No custom Network ACLs found in VPC"
+          fi
+          
+          # Find and delete Subnets
+          echo "Finding subnets in VPC..."
+          SUBNET_IDS=$(aws ec2 describe-subnets \
+            --filters "Name=vpc-id,Values=$VPC_ID" \
+            --query 'Subnets[*].SubnetId' \
+            --output text)
+          
+          for SUBNET_ID in $SUBNET_IDS; do
+            echo "Deleting Subnet: $SUBNET_ID"
+            aws ec2 delete-subnet \
+              --subnet-id "$SUBNET_ID" || echo "Failed to delete Subnet"
+          done
+          
+          # Wait for dependencies to clear
+          echo "Waiting for VPC dependencies to clear (30 seconds)..."
+          sleep 30
+          
+          # Final check for any remaining dependencies
+          echo "Checking for any remaining VPC dependencies..."
+          
+          # Try to delete VPC
+          echo "Deleting VPC: $VPC_ID"
+          DELETE_RESULT=$(aws ec2 delete-vpc --vpc-id "$VPC_ID" 2>&1) || {
+            echo "First VPC deletion attempt failed: $DELETE_RESULT"
+            echo "Looking for specific dependencies mentioned in the error..."
+            
+            # If there are still dependencies, try to forcefully cleanup based on error message
+            if [[ "$DELETE_RESULT" == *"network interface"* ]]; then
+              echo "Network interfaces still detected. Forcing cleanup of all network interfaces..."
+              ENI_IDS=$(aws ec2 describe-network-interfaces \
+                --filters "Name=vpc-id,Values=$VPC_ID" \
+                --query 'NetworkInterfaces[*].NetworkInterfaceId' \
+                --output text)
+                
+              for ENI_ID in $ENI_IDS; do
+                aws ec2 modify-network-interface-attribute \
+                  --network-interface-id "$ENI_ID" \
+                  --no-source-dest-check || echo "Failed to modify network interface"
+                  
+                ATTACHMENT_ID=$(aws ec2 describe-network-interfaces \
+                  --network-interface-ids "$ENI_ID" \
+                  --query 'NetworkInterfaces[0].Attachment.AttachmentId' \
+                  --output text 2>/dev/null)
+                  
+                if [ -n "$ATTACHMENT_ID" ] && [ "$ATTACHMENT_ID" != "None" ]; then
+                  echo "Force detaching Network Interface: $ENI_ID"
+                  aws ec2 detach-network-interface \
+                    --attachment-id "$ATTACHMENT_ID" \
+                    --force || echo "Failed to force detach"
+                  sleep 10
+                fi
+                
+                echo "Force deleting Network Interface: $ENI_ID"
+                aws ec2 delete-network-interface \
+                  --network-interface-id "$ENI_ID" || echo "Failed to force delete network interface"
+              done
+              
+              echo "Waiting another 20 seconds after network interface cleanup..."
+              sleep 20
+            fi
+            
+            # Try deleting VPC again after forced cleanup
+            echo "Trying VPC deletion again: $VPC_ID"
+            aws ec2 delete-vpc --vpc-id "$VPC_ID" || echo "Failed to delete VPC after multiple attempts. Manual cleanup may be required."
+          }
+        else
+          echo "VPC 'loadbalancer-vpc' not found"
+        fi

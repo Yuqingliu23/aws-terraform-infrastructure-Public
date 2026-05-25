@@ -1,0 +1,5 @@
+# comment
+student_name=Yuqing Liu
+api_domain_name=yuqingliu.me
+assignment2_repository=https://github.com/neu-csye6245/assignment-2-cloud-native-web-application-Yuqingliu23
+terraform_repository=https://github.com/neu-csye6245/cloud-project-terraform-aws-infra-Yuqingliu23

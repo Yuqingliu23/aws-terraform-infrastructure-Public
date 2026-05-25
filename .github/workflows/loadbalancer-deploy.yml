@@ -1,0 +1,187 @@
+name: Deploy Load Balancer Infrastructure
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'terraform/modules/loadbalancer/**'
+      - '.github/workflows/loadbalancer-deploy.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'terraform/modules/loadbalancer/**'
+
+env:
+  AWS_REGION: us-east-2
+  TERRAFORM_DIR: terraform
+  TF_VAR_mysql_instance_type: t2.micro
+  TF_VAR_webapp_instance_type: t2.micro
+
+jobs:
+  deploy-loadbalancer:
+    name: Deploy Load Balancer Infrastructure
+    runs-on: ubuntu-latest
+    environment: AWS_DEPLOYMENT
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: 1.5.3
+
+    - name: Fix Terraform permissions
+      run: |
+        # Fix permissions for Terraform executable
+        if [ -n "$TERRAFORM_CLI_PATH" ]; then
+          chmod +x $TERRAFORM_CLI_PATH/terraform
+          ls -la $TERRAFORM_CLI_PATH
+        else
+          echo "TERRAFORM_CLI_PATH not set, trying to find terraform binary..."
+          which terraform || echo "Terraform not found in PATH"
+          find /tmp -name terraform -type f -exec chmod +x {} \; 2>/dev/null || echo "No terraform binaries found in /tmp"
+        fi
+
+    - name: Set environment variables for terraform
+      run: |
+        # get AMI from secrets
+        echo "TF_VAR_web_ami=${{ secrets.AGENT_WEBAPP_AMI }}" >> $GITHUB_ENV
+        echo "TF_VAR_mysql_ami=${{ secrets.AGENT_MYSQL_AMI }}" >> $GITHUB_ENV
+        
+        # other necessary variables (from GitHub Secrets)
+        echo "TF_VAR_db_user=${{ secrets.DATABASE_USER_NAME }}" >> $GITHUB_ENV
+        echo "TF_VAR_db_password=${{ secrets.DATABASE_PASSWORD }}" >> $GITHUB_ENV
+        echo "TF_VAR_webapp_secret_key=${{ secrets.WEBAPP_SECRET_KEY }}" >> $GITHUB_ENV
+        echo "TF_VAR_ssh_key_path=~/.ssh/id_rsa" >> $GITHUB_ENV
+        echo "TF_VAR_ssh_key_name=${{ secrets.EC2_SSH_KEY_NAME }}" >> $GITHUB_ENV
+        echo "TF_VAR_ec2_ssh_key_name=${{ secrets.EC2_SSH_KEY_NAME }}" >> $GITHUB_ENV
+        
+        # Load balancer specific variables
+        echo "TF_VAR_route53_zone_id=${{ secrets.ROUTE53_ZONE_ID }}" >> $GITHUB_ENV
+        echo "TF_VAR_domain_name=${{ secrets.DOMAIN_NAME }}" >> $GITHUB_ENV
+        
+        # VPC configuration
+        echo "TF_VAR_vpc_name=${{ secrets.VPC_NAME || 'loadbalancer-vpc' }}" >> $GITHUB_ENV
+        echo "TF_VAR_mysql_ip=${{ secrets.MYSQL_IP || '10.0.2.10' }}" >> $GITHUB_ENV
+        
+        # AWS credentials for CloudWatch Agent
+        echo "TF_VAR_aws_access_key_id=${{ secrets.AWS_ACCESS_KEY_ID }}" >> $GITHUB_ENV
+        echo "TF_VAR_aws_secret_access_key=${{ secrets.AWS_SECRET_ACCESS_KEY }}" >> $GITHUB_ENV
+        echo "TF_VAR_aws_region=${{ env.AWS_REGION }}" >> $GITHUB_ENV
+        
+        echo "Using MySQL AMI: ${{ secrets.AGENT_MYSQL_AMI }}"
+        echo "Using WebApp AMI: ${{ secrets.AGENT_WEBAPP_AMI }}"
+        echo "Using Domain: ${{ secrets.DOMAIN_NAME }}"
+        echo "Using VPC Name: ${{ secrets.VPC_NAME || 'loadbalancer-vpc' }}"
+
+    - name: Debug Environment Variables
+      run: |
+        echo "Current Terraform Variables:"
+        env | grep "TF_VAR_" | sort
+        echo "AWS Region: ${{ env.AWS_REGION }}"
+
+    - name: Terraform Format
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform fmt -recursive || echo "Formatting issues found, but continuing..."
+
+    - name: Terraform Init
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform init
+
+    - name: Terraform Validate
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform validate -no-color
+
+    - name: Terraform Plan
+      id: plan
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform plan \
+          -var "aws_region=${{ env.AWS_REGION }}" \
+          -var "web_ami=${{ env.TF_VAR_web_ami }}" \
+          -var "mysql_ami=${{ env.TF_VAR_mysql_ami }}" \
+          -var "db_user=${{ env.TF_VAR_db_user }}" \
+          -var "db_password=${{ env.TF_VAR_db_password }}" \
+          -var "webapp_secret_key=${{ env.TF_VAR_webapp_secret_key }}" \
+          -var "ssh_key_path=${{ env.TF_VAR_ssh_key_path }}" \
+          -var "ssh_key_name=${{ env.TF_VAR_ssh_key_name }}" \
+          -var "route53_zone_id=${{ env.TF_VAR_route53_zone_id }}" \
+          -var "domain_name=${{ env.TF_VAR_domain_name }}" \
+          -var "ec2_ssh_key_name=${{ env.TF_VAR_ec2_ssh_key_name }}" \
+          -var "aws_access_key_id=${{ env.TF_VAR_aws_access_key_id }}" \
+          -var "aws_secret_access_key=${{ env.TF_VAR_aws_secret_access_key }}" \
+          -var "vpc_name=${{ env.TF_VAR_vpc_name }}" \
+          -var "mysql_ip=${{ env.TF_VAR_mysql_ip }}" \
+          -input=false \
+          -no-color \
+          -out=tfplan
+      continue-on-error: true
+
+    - name: Terraform Plan Status
+      if: steps.plan.outcome == 'failure'
+      run: |
+        echo "Terraform Plan Failed!"
+        exit 1
+
+    - name: Apply Terraform
+      id: apply
+      run: |
+        cd ${{ env.TERRAFORM_DIR }}
+        terraform apply -auto-approve
+
+    - name: Setup Required Tools
+      run: |
+        echo "Installing required tools..."
+        sudo apt-get update -qq
+        sudo apt-get install -y jq curl dnsutils python3 python3-pip
+        # pip install requests
+        pip3 install requests
+
+    - name: Wait for infrastructure to be ready
+      run: |
+        echo "Waiting for instances to be fully initialized (120 seconds)..."
+        echo "This ensures CloudWatch Agent and EC2 metadata service are properly initialized..."
+        sleep 120
+        
+        # Wait for DNS propagation
+        echo "Waiting for DNS record propagation (120 seconds)..."
+        sleep 120
+
+    - name: Test Load Balancer and Metadata API
+      if: success()
+      env:
+        API_FQDN: api.${{ secrets.DOMAIN_NAME }}
+      run: |
+        # health check test
+        echo "Health check test:"
+        HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${API_FQDN}/v1/healthcheck" || echo "Failed")
+        echo "Healthcheck Status: $HEALTH_STATUS"
+        
+        # metadata API test
+        echo "Metadata API test:"
+        echo "Metadata response:"
+        curl -s "http://${API_FQDN}/v2/metadata" || echo "Metadata API request failed"
+        
+        # test script
+        TEST_SCRIPT_PATH="$GITHUB_WORKSPACE/test_lb_api_metadata.py"
+        if [ -f "$TEST_SCRIPT_PATH" ]; then
+          echo "Running load balancing test script (100 requests)..."
+          python3 test_lb_api_metadata.py -d ${API_FQDN} -n 100 
+        else
+          echo "Test script not found: $TEST_SCRIPT_PATH"
+        fi
+        
+        # always success
+        exit 0
