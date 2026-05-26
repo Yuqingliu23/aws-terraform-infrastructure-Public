@@ -1,4 +1,4 @@
-# AWS Load Balancer Infrastructure Project
+# AWS Terraform Infrastructure Project
 
 ## Project Overview
 
