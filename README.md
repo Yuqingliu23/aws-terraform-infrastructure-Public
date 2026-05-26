@@ -26,10 +26,6 @@ This project is useful for demonstrating:
 - Automated deployment and destruction workflows
 - Cloud monitoring and deployment validation
 
-## System Architecture
-
-![Architecture Diagram](docs/architecture.png)
-
 ## Core Components
 
 - **Network Load Balancer (NLB)**: Distributes incoming traffic to EC2 web instances.
